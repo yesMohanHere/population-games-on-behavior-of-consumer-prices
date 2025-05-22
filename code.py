@@ -28,6 +28,15 @@ S_II_AVG = 0.005 # Average diagonal element of voltage sensitivity matrix (simpl
 # Initial average previous action for voltage calculation (simplified)
 PREV_TOTAL_CONSUMPTION_AVG = 50.0 # Placeholder for initial aggregate previous action
 
+# Dynamic renewable generation parameters
+# Amplitude controls the magnitude of seasonal variation while NOISE_STD adds
+# random fluctuations to capture weather uncertainty.
+R_DYNAMIC_AMPLITUDE = 0.3  # 30% seasonal variation
+R_NOISE_STD = 0.1          # Standard deviation of multiplicative noise
+
+# Aggregator risk aversion for price volatility
+AGG_RISK_COEFF = 0.05
+
 
 # --- 2. Consumer Model Functions (Prospect Theory) ---
 
@@ -236,9 +245,12 @@ def aggregator_profit_objective(price_probabilities, consumer_population_state,
     voltage_deviation = calculate_voltage_deviation(
         total_consumption_predicted, S_II_AVG, initial_voltage_pu, prev_total_consumption
     )
-    voltage_penalty = aggregator_params['THETA_AGGREGATOR'] * voltage_deviation**2 # Using squared deviation for penalty
-    
-    profit = revenue - cost_da - additional_energy_cost - voltage_penalty
+    voltage_penalty = aggregator_params['THETA_AGGREGATOR'] * voltage_deviation**2
+
+    # Risk aversion: penalize high variance in price distribution
+    risk_penalty = aggregator_params.get('RISK_COEFF', 0.0) * np.var(price_probabilities)
+
+    profit = revenue - cost_da - additional_energy_cost - voltage_penalty - risk_penalty
     
     return -profit # Minimize negative profit (maximize profit)
 
@@ -286,6 +298,13 @@ class PopulationGameSimulation:
         current_price_distribution = np.ones(len(self.price_options)) / len(self.price_options) # Initial uniform price distribution
 
         for t in range(time_steps):
+            # Update renewable generation with seasonal pattern and noise
+            for params in self.consumer_types_params:
+                base_R = params.get('R_base', params['R_i'])
+                seasonal = 1 + R_DYNAMIC_AMPLITUDE * np.sin(2 * np.pi * t / time_steps)
+                noise = np.random.normal(1.0, R_NOISE_STD)
+                params['R_i'] = max(base_R * seasonal * noise, 0.0)
+
             # --- Aggregator's Turn: Optimize Price Distribution ---
             # Define bounds for probabilities (0 to 1)
             bounds = [(0, 1)] * len(self.price_options)
@@ -335,8 +354,8 @@ class PopulationGameSimulation:
                 # Calculate average payoff for this consumer type
                 avg_payoff_for_type = np.sum(current_type_proportions * payoffs_for_actions)
                 
-                # Apply replicator dynamics update rule
-                # x_dot = x * (payoff - avg_payoff)
+                # Apply replicator dynamics: x' = x (u - \bar{u}) dt
+                # where u is payoff for the action and \bar{u} is the average payoff
                 d_proportions = current_type_proportions * (payoffs_for_actions - avg_payoff_for_type) * dt
                 new_proportions[type_idx] += d_proportions
                 
@@ -349,7 +368,9 @@ class PopulationGameSimulation:
                     new_proportions[type_idx] = np.ones(self.num_actions) / self.num_actions # Reset to uniform if all vanish
 
                 # Calculate total consumption for this type
-                total_current_consumption += np.sum(new_proportions[type_idx] * self.action_values)
+                avg_action = np.sum(new_proportions[type_idx] * self.action_values)
+                total_current_consumption += avg_action
+                consumer_params['a_hat_i'] = avg_action
 
             self.proportions = new_proportions
 
@@ -451,10 +472,10 @@ if __name__ == "__main__":
     # Type D: Low comfort-seeking and grid aware, very irrational
     
     consumer_types_params = [
-        {'beta': 0.85, 'gamma': 1.0, 'alpha': 1.0, 'R_i': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type A
-        {'beta': 0.75, 'gamma': 1.0, 'alpha': 0.9, 'R_i': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type B
-        {'beta': 0.75, 'gamma': 0.0, 'alpha': 0.7, 'R_i': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type C
-        {'beta': 0.40, 'gamma': 1.0, 'alpha': 0.5, 'R_i': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type D
+        {'beta': 0.85, 'gamma': 1.0, 'alpha': 1.0, 'R_i': 10.0, 'R_base': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type A
+        {'beta': 0.75, 'gamma': 1.0, 'alpha': 0.9, 'R_i': 10.0, 'R_base': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type B
+        {'beta': 0.75, 'gamma': 0.0, 'alpha': 0.7, 'R_i': 10.0, 'R_base': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type C
+        {'beta': 0.40, 'gamma': 1.0, 'alpha': 0.5, 'R_i': 10.0, 'R_base': 10.0, 'v_i': INITIAL_VOLTAGE_PU, 'S_ii': S_II_AVG, 'a_hat_i': 5.0}, # Type D
     ]
 
     num_consumer_types = len(consumer_types_params)
@@ -469,7 +490,8 @@ if __name__ == "__main__":
         'RHO_DA': RHO_DA,
         'A_AGGREGATOR': A_AGGREGATOR,
         'RHO_RT': RHO_RT,
-        'THETA_AGGREGATOR': THETA_AGGREGATOR
+        'THETA_AGGREGATOR': THETA_AGGREGATOR,
+        'RISK_COEFF': AGG_RISK_COEFF
     }
 
     # Create and run the simulation
